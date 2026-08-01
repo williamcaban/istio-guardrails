@@ -54,41 +54,41 @@ Labeled App Pod
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                     OpenShift Cluster                            │
-│                                                                  │
+│                     OpenShift Cluster                           │
+│                                                                 │
 │  ┌─────────── istio-system ─────────┐                           │
 │  │  istiod (Istio 1.28.5)           │  ← Sail Operator manages  │
-│  │  discovery: istio-discovery=enabled                           │
+│  │  discovery: istio-discovery=enabled                          │
 │  └──────────────────────────────────┘                           │
-│                                                                  │
+│                                                                 │
 │  ┌─────────── guardrails ───────────────────────────────────┐   │
-│  │  NemoGuardrails CR: nemo-pii                              │   │
+│  │  NemoGuardrails CR: nemo-pii                             │   │
 │  │  ├─ Deployment: nemo-pii (1 pod, port 8000)              │   │
 │  │  ├─ Service: nemo-pii (ClusterIP, port 80 → 8000)        │   │
-│  │  └─ ConfigMap: nemo-pii-config                            │   │
-│  │       ├─ config.yaml (PII entities, regex patterns)       │   │
-│  │       └─ rails.co (Colang — empty for built-in rails)     │   │
-│  │  AuthorizationPolicy: allow only from app-ns              │   │
-│  └───────────────────────────────────────────────────────────┘  │
-│                                                                  │
+│  │  └─ ConfigMap: nemo-pii-config                           │   │
+│  │       ├─ config.yaml (PII entities, regex patterns)      │   │
+│  │       └─ rails.co (Colang — empty for built-in rails)    │   │
+│  │  AuthorizationPolicy: allow only from app-ns             │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                                                                 │
 │  ┌─────────── app-ns ───────────────────────────────────────┐   │
-│  │  WasmPlugin: nemo-input-guard                             │   │
-│  │  ├─ selector: guardrails.trustyai.io/config=pii           │   │
-│  │  ├─ phase: AUTHN, priority: 10                            │   │
+│  │  WasmPlugin: nemo-input-guard                            │   │
+│  │  ├─ selector: guardrails.trustyai.io/config=pii          │   │
+│  │  ├─ phase: AUTHN, priority: 10                           │   │
 │  │  └─ url: http://wasm-server.app-ns.svc:8080/plugin.wasm  │   │
-│  │                                                            │   │
-│  │  Deployment: wasm-server (Python http.server, port 8080)  │   │
-│  │  ├─ Serves: plugin.wasm (3.4 MB compiled Wasm binary)     │   │
-│  │  └─ sidecar.istio.io/inject: "false"                      │   │
-│  │                                                            │   │
-│  │  Deployment: test-app [label: guardrails.../config=pii]   │   │
-│  │  └─ 2/2 Running (app + Envoy sidecar)                     │   │
-│  │       └── WasmPlugin active on this pod only              │   │
-│  │                                                            │   │
-│  │  Deployment: httpbin (mock model backend, port 8080)       │   │
-│  │  └─ 2/2 Running (app + Envoy sidecar)                     │   │
-│  │       └── NO guardrail label — WasmPlugin does NOT apply  │   │
-│  └───────────────────────────────────────────────────────────┘  │
+│  │                                                          │   │
+│  │  Deployment: wasm-server (Python http.server, port 8080) │   │
+│  │  ├─ Serves: plugin.wasm (3.4 MB compiled Wasm binary)    │   │
+│  │  └─ sidecar.istio.io/inject: "false"                     │   │
+│  │                                                          │   │
+│  │  Deployment: test-app [label: guardrails.../config=pii]  │   │
+│  │  └─ 2/2 Running (app + Envoy sidecar)                    │   │
+│  │       └── WasmPlugin active on this pod only             │   │
+│  │                                                          │   │
+│  │  Deployment: httpbin (mock model backend, port 8080)     │   │
+│  │  └─ 2/2 Running (app + Envoy sidecar)                    │   │
+│  │       └── NO guardrail label — WasmPlugin does NOT apply │   │
+│  └──────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
