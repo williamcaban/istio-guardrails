@@ -1,452 +1,588 @@
-# Implementation Plan: Istio TrafficExtension × NeMo Guardrails POC
+# Implementation Plan: Istio WasmPlugin × NeMo Guardrails POC
 
-**Version**: 0.1  
-**Date**: 2026-07-31  
-**Repo**: `/Users/williamcaban/Documents/devel/wc-knowledge-base/istio-guardrails/`
+**Version**: 1.0 (Validated)  
+**Date**: 2026-08-01  
+**Cluster**: OCP 4.21.17, OSSM 3.3.1 (Istio 1.28.5), RHOAI 3.4.2  
+**Repo**: https://github.com/williamcaban/istio-guardrails
 
 ---
 
-## Repository Layout
+## What changed from the original plan
+
+| Item | Originally planned | What actually happened |
+|---|---|---|
+| Extension API | `TrafficExtension` (Istio 1.30+) | **`WasmPlugin`** — TrafficExtension not in Istio 1.28.5 |
+| Phase 1 mechanism | Inline Lua via TrafficExtension | **Wasm module** via WasmPlugin |
+| Wasm serving | `oci://quay.io/...` | **`http://wasm-server.../plugin.wasm`** — Envoy cannot verify internal registry self-signed cert |
+| Wasm build | TinyGo locally | **Fedora + Go 1.24 in OpenShift** via `oc new-build` |
+| RHOAI version | 3.5 | **3.4.2** — NeMo CRD spec has `default: true` field |
+| NeMo service port | 8000 | **80** (operator creates svc port 80 → container 8000) |
+| Envoy cluster name | `outbound\|8000\|...` | **`outbound\|80\|...`** |
+| Istio mode | Existing mesh | **New Istio CR needed** — existing `openshift-gateway` is gateway-only |
+| Internal registry | Assumed enabled | **Had to enable** (`managementState: Removed` → `Managed`) |
+| Label placement | Deployment `metadata.labels` | **Pod template** `spec.template.metadata.labels` — WasmPlugin matches pod labels |
+
+---
+
+## Repository Layout (current)
 
 ```
 istio-guardrails/
+├── LICENSE                           ← Apache 2.0
+├── README.md                         ← operator guide (run/test/remove)
 ├── docs/
-│   ├── design.md               ← this repo's architecture (read first)
-│   └── implementation-plan.md  ← this file
+│   ├── design.md                     ← architecture and design decisions
+│   └── implementation-plan.md        ← this file
 │
 ├── deploy/
-│   ├── nemo/                   ← NeMo Guardrails manifests
+│   ├── nemo/                         ← NeMo manifests — apply in order (00 → 03)
 │   │   ├── 00-namespace.yaml
 │   │   ├── 01-configmap-pii.yaml
-│   │   ├── 02-nemoguardrails-cr.yaml
+│   │   ├── 02-nemoguardrails-cr.yaml  ← NemoGuardrails CR with default: true
 │   │   └── 03-authorizationpolicy.yaml
 │   │
 │   ├── ossm/
+│   │   ├── phase1-wasm/
+│   │   │   └── wasmplugin.yaml       ← WasmPlugin (ACTIVE, validated)
 │   │   ├── phase1-lua/
-│   │   │   └── traffic-extension-lua.yaml
+│   │   │   └── traffic-extension-lua.yaml  ← Lua option (requires Istio 1.30+)
 │   │   └── phase2-wasm/
-│   │       └── traffic-extension-wasm.yaml
+│   │       └── traffic-extension-wasm.yaml  ← TrafficExtension (requires Istio 1.30+)
 │   │
 │   └── app-ns/
 │       ├── 00-namespace.yaml
-│       └── test-app.yaml       ← minimal curl-based test pod
+│       ├── httpbin.yaml              ← mock backend (gunicorn -b 0.0.0.0:8080)
+│       └── test-app.yaml             ← curl test client
 │
 ├── lua/
-│   └── nemo-input-guard.lua    ← standalone Lua script (also embedded in YAML)
+│   └── nemo-input-guard.lua          ← Lua script (for future TrafficExtension use)
 │
-├── wasm/
-│   ├── main.go                 ← proxy-wasm-go-sdk plugin
-│   ├── go.mod
-│   └── Makefile
-│
-└── scripts/
-    ├── 00-prereqs.sh           ← Phase 0: verify CRDs, label namespaces
-    ├── 01-deploy-nemo.sh       ← Phase 0: deploy NeMo + validate
-    ├── 02-get-cluster-name.sh  ← Phase 0: extract Envoy cluster name
-    ├── 03-deploy-phase1.sh     ← Phase 1: deploy TrafficExtension + Lua
-    ├── 04-deploy-phase2.sh     ← Phase 2: build Wasm + deploy
-    └── test/
-        ├── test-blocked.sh     ← assert 403 on PII input
-        ├── test-allowed.sh     ← assert 200 on clean input
-        └── test-response.sh    ← Phase 2: assert 403 on PII in response
+└── wasm/
+    ├── main.go                       ← Go Wasm plugin (proxy-wasm/proxy-wasm-go-sdk)
+    ├── go.mod                        ← Go 1.24, proxy-wasm/proxy-wasm-go-sdk
+    ├── Dockerfile                    ← scratch image (wasm binary only)
+    ├── Dockerfile.httpserver         ← Fedora build + UBI Python HTTP server (USED)
+    └── Makefile
 ```
 
 ---
 
-## Phase 0 — Prerequisites (Day 1)
+## Phase 0 — Prerequisites ✓ DONE
 
-**Goal**: Cluster is ready, NeMo is deployed and validated, Envoy cluster name captured.
+**Cluster**: OCP 4.21.17 / OSSM 3.3.1 (Istio 1.28.5) / RHOAI 3.4.2
 
-### Task 0.1 — Verify OSSM and TrafficExtension
+### Task 0.1 — Enable internal image registry ✓
+
+The internal registry was `Removed`. Enabled with emptyDir (single-node POC):
 
 ```bash
-# Run scripts/00-prereqs.sh
-
-# 1. Verify OSSM installed
-oc get istiorevisions
-# NAME      TYPE    READY   STATUS    VERSION   AGE
-# default   Local   True    Healthy   v1.24.x   ...
-
-# 2. Verify TrafficExtension CRD present (STOP if absent — escalate to OSSM team)
-oc get crd trafficextensions.extensions.istio.io
-# If absent: contact Jamie Longmuir (jlongmui)
-
-# 3. Get Istio revision name (needed for namespace labels)
-export ISTIO_REV=$(oc get istiorevisions -o jsonpath='{.items[0].metadata.name}')
-echo "Revision: $ISTIO_REV"
-# If "default" → use istio-injection=enabled
-# If other name → use istio.io/rev=$ISTIO_REV
+oc patch configs.imageregistry.operator.openshift.io/cluster \
+  --type merge \
+  -p '{"spec":{"managementState":"Managed","storage":{"emptyDir":{}}}}'
+oc rollout status deployment/image-registry -n openshift-image-registry --timeout=180s
 ```
 
-**Acceptance criteria**: CRD present. Revision name known.
+**Finding**: Always check registry state before attempting builds.
 
----
+### Task 0.2 — Deploy OSSM Istio service mesh ✓
 
-### Task 0.2 — Label namespaces
+The existing `openshift-gateway` Istio CR is a gateway-only deployment (not a service mesh) created by the RHOAI AI Gateway — no Sail Operator `Istio` CR exists. A new one was needed:
 
 ```bash
-# NeMo namespace (mesh-visible, no sidecar injection)
-oc new-project guardrails || true
-oc label namespace guardrails istio-discovery=enabled --overwrite
+oc create namespace istio-system istio-cni
 
-# App namespace (mesh-visible + sidecar injection)
-oc new-project app-ns || true
-if [ "$ISTIO_REV" = "default" ]; then
-  oc label namespace app-ns istio-discovery=enabled istio-injection=enabled --overwrite
-else
-  oc label namespace app-ns istio-discovery=enabled istio.io/rev=$ISTIO_REV --overwrite
-fi
+cat <<EOF | oc apply -f -
+apiVersion: sailoperator.io/v1
+kind: IstioCNI
+metadata:
+  name: default
+spec:
+  namespace: istio-cni
+EOF
 
-# Model namespace (if separate — label for mesh visibility)
-# oc label namespace model-ns istio-discovery=enabled istio-injection=enabled --overwrite
+cat <<EOF | oc apply -f -
+apiVersion: sailoperator.io/v1
+kind: Istio
+metadata:
+  name: default
+spec:
+  version: v1.28.5
+  namespace: istio-system
+  values:
+    meshConfig:
+      discoverySelectors:
+        - matchLabels:
+            istio-discovery: enabled
+EOF
+
+oc wait istio/default --for=jsonpath='{.status.state}'=Healthy --timeout=180s
 ```
 
-**Acceptance criteria**: All namespaces labeled. Pods in `app-ns` show 2/2 containers after rollout.
+**Finding**: Do not need `nativeNftables: true` on RHCOS 9.x (only RHCOS 10+).
 
----
-
-### Task 0.3 — Deploy NeMo Guardrails
-
-Apply `deploy/nemo/` in order:
+### Task 0.3 — Label namespaces ✓
 
 ```bash
-# 1. Namespace (if not already created above)
-oc apply -f deploy/nemo/00-namespace.yaml
+oc create namespace guardrails
+oc label namespace guardrails istio-discovery=enabled
 
-# 2. ConfigMap with PII detection rails
-oc apply -f deploy/nemo/01-configmap-pii.yaml
+oc create namespace app-ns
+oc label namespace app-ns istio-discovery=enabled istio-injection=enabled
+# Revision name is "default" on this cluster → istio-injection=enabled is correct
+```
 
-# 3. NemoGuardrails CR (TrustyAI Operator creates Service, Deployment, Route)
-oc apply -f deploy/nemo/02-nemoguardrails-cr.yaml
+### Task 0.4 — Deploy NeMo Guardrails ✓
 
-# 4. Wait for Ready
+```bash
+oc apply -f deploy/nemo/
 oc wait nemoguardrails/nemo-pii -n guardrails \
   --for=jsonpath='{.status.phase}'=Ready --timeout=300s
-
-# 5. AuthorizationPolicy
-oc apply -f deploy/nemo/03-authorizationpolicy.yaml
 ```
 
-**Acceptance criteria**: `oc get nemoguardrails nemo-pii -n guardrails` shows `PHASE: Ready`.
+**Finding**: The `NemoGuardrails` CR requires `nemoConfigs[].default: true` in RHOAI 3.4.2 (not documented in RHOAI 3.5 quickstart).
 
----
+**Finding**: NeMo service is created on port **80** (not 8000). Port 80 maps to container port 8000. Port-forward uses `svc/nemo-pii 8080:80`.
 
-### Task 0.4 — Validate NeMo endpoint
+### Task 0.5 — Validate NeMo endpoint ✓
 
 ```bash
-# Run scripts/01-deploy-nemo.sh (includes validation)
+oc -n guardrails port-forward svc/nemo-pii 8080:80 &
 
-oc -n guardrails port-forward svc/nemo-pii 8000:8000 &
-sleep 2
-
-# Should return: "success"
-STATUS=$(curl -s http://localhost:8000/v1/guardrail/checks \
+curl -s http://localhost:8080/v1/guardrail/checks \
   -H "Content-Type: application/json" \
-  -d '{"model":"","messages":[{"role":"user","content":"What is Kubernetes?"}]}' \
-  | jq -r .status)
-echo "Clean request: $STATUS"   # expected: success
+  -d '{"model":"","messages":[{"role":"user","content":"What is Kubernetes?"}]}' | jq .status
+# "success"
 
-# Should return: "blocked"
-STATUS=$(curl -s http://localhost:8000/v1/guardrail/checks \
+curl -s http://localhost:8080/v1/guardrail/checks \
   -H "Content-Type: application/json" \
-  -d '{"model":"","messages":[{"role":"user","content":"My SSN is 123-45-6789"}]}' \
-  | jq -r .status)
-echo "PII request: $STATUS"     # expected: blocked
+  -d '{"model":"","messages":[{"role":"user","content":"My SSN is 123-45-6789"}]}' | jq .status
+# "blocked"
 
 kill %1
 ```
 
-**Acceptance criteria**: `"success"` and `"blocked"` returned correctly. **Do not proceed to Phase 1 if either fails.**
-
----
-
-### Task 0.5 — Capture Envoy cluster name
+### Task 0.6 — Capture Envoy cluster name ✓
 
 ```bash
-# Run scripts/02-get-cluster-name.sh
-
-# Deploy a minimal test pod in app-ns (needs sidecar to query clusters)
 oc apply -f deploy/app-ns/test-app.yaml
-oc wait pod -n app-ns -l app=test-app --for=condition=Ready --timeout=60s
+oc rollout status deployment/test-app -n app-ns --timeout=60s
 
-# Get exact Envoy cluster name for NeMo service
 oc exec -n app-ns deploy/test-app -c istio-proxy -- \
-  pilot-agent request GET /clusters 2>/dev/null \
-  | grep "nemo-pii.guardrails"
-
-# Save output — it looks like:
-# outbound|8000||nemo-pii.guardrails.svc.cluster.local
-
-export NEMO_CLUSTER="outbound|8000||nemo-pii.guardrails.svc.cluster.local"
-echo "NEMO_CLUSTER=$NEMO_CLUSTER"
+  pilot-agent request GET /clusters 2>/dev/null | grep nemo-pii | head -1 | cut -d: -f1
+# outbound|80||nemo-pii.guardrails.svc.cluster.local
 ```
 
-**Acceptance criteria**: Cluster name captured and matches the expected pattern.
-
-> ⚠️ **Critical**: Update the cluster name string in `lua/nemo-input-guard.lua` and `deploy/ossm/phase1-lua/traffic-extension-lua.yaml` before Phase 1 if the captured name differs from the default.
+**Finding**: Cluster name uses the **service port (80)**, not the container port (8000). This differs from what was expected.
 
 ---
 
-## Phase 1 — TrafficExtension + Lua: Input Guard (Days 2-4)
+## Phase 1 — WasmPlugin: Input Guard ✓ DONE
 
-**Goal**: A labeled pod's LLM requests are intercepted. PII in the request body returns 403 before the request reaches the model.
+**Mechanism**: `WasmPlugin` (not TrafficExtension — not available in Istio 1.28.5).  
+**Result**: PII requests blocked with 403. Clean requests pass. Validated on 2026-08-01.
 
-### Task 1.1 — Review and update Lua script
+### Task 1.1 — Build Wasm module in OpenShift ✓
 
-File: `lua/nemo-input-guard.lua`
-
-Verify the `NEMO_CLUSTER` constant matches what was captured in Task 0.5. If it differs, update both the standalone file and the embedded version in `deploy/ossm/phase1-lua/traffic-extension-lua.yaml`.
-
-```lua
--- Top of file: verify these match your cluster
-local NEMO_CLUSTER = "outbound|8000||nemo-pii.guardrails.svc.cluster.local"
-local NEMO_HOST    = "nemo-pii.guardrails.svc.cluster.local"
-local NEMO_PATH    = "/v1/guardrail/checks"   -- RHOAI 3.5
-local TIMEOUT_MS   = 300
-```
-
-### Task 1.2 — Deploy TrafficExtension
+No local TinyGo required. Built entirely in-cluster using `oc new-build`:
 
 ```bash
-# Run scripts/03-deploy-phase1.sh
-oc apply -f deploy/ossm/phase1-lua/traffic-extension-lua.yaml
+# Create BuildConfig
+oc new-build --strategy=docker --binary --name=nemo-wasm-guard -n app-ns
 
-# Verify resource created
-oc get trafficextension -n app-ns
+# Patch to use the HTTP server Dockerfile (Fedora + Go 1.24 + Python http.server)
+oc patch bc nemo-wasm-guard -n app-ns \
+  --type=merge \
+  -p '{"spec":{"strategy":{"dockerStrategy":{"dockerfilePath":"Dockerfile.httpserver"}}}}'
+
+# Build (~4 min first run — downloads Fedora packages + Go dependencies)
+cd wasm/
+oc start-build nemo-wasm-guard --from-dir=. --follow -n app-ns
+cd ..
 ```
 
-### Task 1.3 — Label test app
+**Build details**:
+- Base image: `registry.fedoraproject.org/fedora-minimal:latest` (Go 1.24.x included)
+- SDK: `github.com/proxy-wasm/proxy-wasm-go-sdk v0.0.0-20260105142703-44c7d5847745`
+- Build command: `GOOS=wasip1 GOARCH=wasm go build -buildmode=c-shared -o plugin.wasm ./...`
+- Output binary: ~3.4 MB
+
+**Finding**: `tetratelabs/proxy-wasm-go-sdk` (archived) is TinyGo-only. Use `proxy-wasm/proxy-wasm-go-sdk` for standard Go 1.24+.
+
+### Task 1.2 — Deploy wasm-server ✓
+
+Envoy cannot pull from `oci://` using the internal registry's self-signed certificate. `ISTIO_META_INSECURE_REGISTRIES` does not bypass TLS in Istio 1.28.5. Solved by serving the binary over plain HTTP:
 
 ```bash
-kubectl label deployment test-app \
-  guardrails.trustyai.io/config=pii -n app-ns
-
-# Restart to ensure filter picks up
-oc rollout restart deployment/test-app -n app-ns
-oc rollout status deployment/test-app -n app-ns
+cat <<'EOF' | oc apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wasm-server
+  namespace: app-ns
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: wasm-server
+  template:
+    metadata:
+      labels:
+        app: wasm-server
+      annotations:
+        sidecar.istio.io/inject: "false"   # infrastructure pod, no guardrail
+    spec:
+      containers:
+      - name: wasm-server
+        image: image-registry.openshift-image-registry.svc:5000/app-ns/nemo-wasm-guard:latest
+        ports:
+        - containerPort: 8080
+        resources:
+          requests: {cpu: 10m, memory: 32Mi}
+          limits: {cpu: 100m, memory: 64Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: wasm-server
+  namespace: app-ns
+spec:
+  selector:
+    app: wasm-server
+  ports:
+  - port: 8080
+    targetPort: 8080
+EOF
+oc rollout status deployment/wasm-server -n app-ns --timeout=60s
 ```
 
-### Task 1.4 — Verify filter is loaded in Envoy
+### Task 1.3 — Deploy WasmPlugin ✓
 
 ```bash
-istioctl proxy-config listener -n app-ns deploy/test-app \
-  --port 8080 -o json | grep -i "lua\|envoy.filters.http.lua"
-# Must return a match — if empty, filter is not applied
+cat <<'EOF' | oc apply -f -
+apiVersion: extensions.istio.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: nemo-input-guard
+  namespace: app-ns
+spec:
+  selector:
+    matchLabels:
+      guardrails.trustyai.io/config: pii
+  phase: AUTHN
+  priority: 10
+  url: http://wasm-server.app-ns.svc:8080/plugin.wasm
+  pluginConfig:
+    nemoCluster: "outbound|80||nemo-pii.guardrails.svc.cluster.local"
+    nemoHost: "nemo-pii.guardrails.svc.cluster.local"
+    nemoPath: "/v1/guardrail/checks"
+    timeoutMs: 300
+    failMode: "closed"
+EOF
 ```
 
-### Task 1.5 — Run tests
+### Task 1.4 — Label test application ✓
+
+**Critical**: the label must be on the **pod template**, not the `Deployment` resource's own labels:
 
 ```bash
-# From test pod in app-ns (replace <model-svc> with actual model service URL)
-MODEL_SVC="http://vllm-svc.model-ns.svc:8080"
+# Wrong — does nothing for WasmPlugin:
+kubectl label deployment test-app guardrails.trustyai.io/config=pii -n app-ns
 
-# Test 1: SSN in request → expect 403
-bash scripts/test/test-blocked.sh $MODEL_SVC
-
-# Test 2: Clean request → expect 200
-bash scripts/test/test-allowed.sh $MODEL_SVC
-
-# Test 3: Measure latency overhead (run 5 times, average)
-for i in $(seq 5); do
-  time curl -s -o /dev/null \
-    -H "Content-Type: application/json" \
-    -d '{"model":"llama3","messages":[{"role":"user","content":"Hello"}]}' \
-    $MODEL_SVC/v1/chat/completions
-done
+# Correct — patches pod template labels:
+kubectl patch deployment test-app -n app-ns \
+  --type=merge \
+  -p '{"spec":{"template":{"metadata":{"labels":{"guardrails.trustyai.io/config":"pii"}}}}}'
 ```
 
-**Phase 1 acceptance criteria**:
-- [ ] PII request (SSN, email, credit card) returns 403
-- [ ] Clean request returns 200 and reaches the model
-- [ ] Unlabeled pod is NOT intercepted (verify same clean request from unlabeled pod returns 200 without TrafficExtension latency)
-- [ ] Latency overhead documented (target: < 400ms)
-- [ ] Filter visible in Envoy listener config
+Also deploy the mock backend:
+
+```bash
+oc apply -f deploy/app-ns/httpbin.yaml
+```
+
+**Finding**: httpbin image binds to port 80 by default, which requires root — blocked by OpenShift's restricted SCC. Solution: override with `gunicorn -b 0.0.0.0:8080` in the Deployment command.
+
+### Task 1.5 — Validate Phase 1 ✓
+
+All tests passed on 2026-08-01:
+
+```bash
+MODEL_SVC="http://httpbin.app-ns.svc:8080"
+
+# Test 1: SSN → 403 ✓
+oc exec -n app-ns deploy/test-app -- \
+  curl -s -w "\nHTTP: %{http_code}\n" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"llama3","messages":[{"role":"user","content":"My SSN is 123-45-6789"}]}' \
+  $MODEL_SVC/post
+# {"error":"blocked_by_guardrail","message":"Content blocked by safety guardrails"}
+# HTTP: 403
+
+# Test 2: Email → 403 ✓
+oc exec -n app-ns deploy/test-app -- \
+  curl -s -w "\nHTTP: %{http_code}\n" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"llama3","messages":[{"role":"user","content":"Contact alice@example.com"}]}' \
+  $MODEL_SVC/post
+# HTTP: 403
+
+# Test 3: api_key keyword → 403 ✓
+oc exec -n app-ns deploy/test-app -- \
+  curl -s -w "\nHTTP: %{http_code}\n" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"llama3","messages":[{"role":"user","content":"My api_key is sk-abc123"}]}' \
+  $MODEL_SVC/post
+# HTTP: 403
+
+# Test 4: Clean request → 200 ✓
+oc exec -n app-ns deploy/test-app -- \
+  curl -s -w "\nHTTP: %{http_code}\n" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"llama3","messages":[{"role":"user","content":"Explain Kubernetes networking"}]}' \
+  $MODEL_SVC/post
+# HTTP: 200
+
+# Test 5: Unlabeled pod — WasmPlugin does NOT apply ✓
+oc get pod -n app-ns -l app=httpbin \
+  -o jsonpath='{.items[0].metadata.labels}' | grep -q guardrail \
+  && echo "UNEXPECTED" || echo "No guardrail label — correct"
+```
+
+**NeMo call stats** (from Envoy cluster dump):
+```
+rq_success: 10   rq_total: 12   rq_timeout: 2
+```
+2 timeouts are from early probes before the Wasm module finished loading. All subsequent calls succeed.
 
 ---
 
-## Phase 2 — TrafficExtension + Wasm: Full Duplex (Days 5-10)
+## Phase 2 — Response Guardrail ☐ PENDING
 
-**Goal**: Both request and response are checked. A model that outputs PII is also blocked.
+**Goal**: Also intercept and check model response bodies before returning to the caller.
 
-### Task 2.1 — Set up Wasm build environment
+**Status**: The `OnHttpResponseBody` handler is implemented in `wasm/main.go` but has not been tested against a real model that can be prompted to output PII.
 
-```bash
-cd wasm/
+### Prerequisites for Phase 2
 
-# Verify Go installed (1.21+)
-go version
+1. A deployed vLLM or InferenceService endpoint in the cluster (none exists on the test cluster currently)
+2. Or a mock that echoes arbitrary content in the response body
 
-# Install TinyGo (needed for WASI/Wasm target)
-# macOS: brew install tinygo
-tinygo version
+### Task 2.1 — Deploy a model endpoint
 
-# Install proxy-wasm-go-sdk
-go mod download
-```
+Options:
+- Deploy a small InferenceService using RHOAI KServe (requires GPU or CPU-only model)
+- Or patch httpbin to reflect the request body in the response for testing purposes
 
-### Task 2.2 — Build Wasm module
+### Task 2.2 — Validate response blocking
 
 ```bash
-cd wasm/
-make build
-# Output: nemo-guard.wasm
+MODEL_SVC="http://<vllm-or-isvc>.model-ns.svc:8080"
 
-# Verify binary
-file nemo-guard.wasm
-# nemo-guard.wasm: WebAssembly (wasm) binary module version 0x1
-```
-
-### Task 2.3 — Push to OCI registry
-
-```bash
-cd wasm/
-
-# Log into Quay.io (or internal registry)
-docker login quay.io
-
-# Build and push OCI artifact
-make push REGISTRY=quay.io/rhai-guardrails TAG=0.1.0-poc
-# Pushes: quay.io/rhai-guardrails/nemo-wasm-guard:0.1.0-poc
-```
-
-Update the `url` field in `deploy/ossm/phase2-wasm/traffic-extension-wasm.yaml` with the actual registry path before deploying.
-
-### Task 2.4 — Deploy TrafficExtension with Wasm
-
-```bash
-# Remove Phase 1 Lua extension first
-oc delete trafficextension nemo-input-guard -n app-ns
-
-# Deploy Phase 2 Wasm extension
-oc apply -f deploy/ossm/phase2-wasm/traffic-extension-wasm.yaml
-
-# Verify Wasm plugin pulled and loaded (may take 30-60s for OCI pull)
-oc logs -n app-ns deploy/test-app -c istio-proxy | grep -i "wasm\|nemo"
-```
-
-### Task 2.5 — Run full duplex tests
-
-```bash
-MODEL_SVC="http://vllm-svc.model-ns.svc:8080"
-
-# Test 1: PII in request → expect 403 (same as Phase 1)
-bash scripts/test/test-blocked.sh $MODEL_SVC
-
-# Test 2: Clean request → expect 200
-bash scripts/test/test-allowed.sh $MODEL_SVC
-
-# Test 3: PII in model response → expect 403
-# Requires a prompt that causes the model to echo PII
-bash scripts/test/test-response.sh $MODEL_SVC
+# Prompt the model to echo PII back
+oc exec -n app-ns deploy/test-app -- \
+  curl -s -w "\nHTTP: %{http_code}\n" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"llama3","messages":[{"role":"user","content":"Repeat verbatim: My SSN is 123-45-6789"}]}' \
+  $MODEL_SVC/v1/chat/completions
+# Expected: HTTP: 403 (Wasm intercepts response, calls NeMo, blocks)
 ```
 
 **Phase 2 acceptance criteria**:
-- [ ] Input PII blocked: 403
-- [ ] Output PII blocked: 403
-- [ ] Clean request + clean response: 200 end-to-end
-- [ ] Wasm load confirmed in Envoy logs
-- [ ] Latency overhead documented for both input + output check
+- [ ] Response containing SSN returns 403
+- [ ] Clean request + clean response returns 200 end-to-end
+- [ ] NeMo `rq_total` increments by 2 per request (one for input, one for output)
 
 ---
 
-## Troubleshooting Guide
+## Requirements for TrafficExtension Migration (Future)
 
-### TrafficExtension not intercepting traffic
+`TrafficExtension` (`extensions.istio.io/v1alpha1`) supersedes `WasmPlugin` and adds inline Lua as a first-class extension type alongside Wasm. It is not available in Istio 1.28.5 (OSSM 3.3.1). This section documents what is needed to migrate when OSSM ships a compatible version.
 
-```bash
-# 1. Verify pod has the label
-oc get pod -n app-ns -l guardrails.trustyai.io/config=pii
+### Istio version requirement
 
-# 2. Verify TrafficExtension selector matches
-oc get trafficextension -n app-ns -o yaml | grep -A5 selector
+| OSSM version | Istio version | TrafficExtension |
+|---|---|---|
+| 3.3.1 (current) | 1.28.5 | ❌ Not available |
+| Future | 1.30+ | ✅ Available (tech preview per Jamie Longmuir, OSSM PM) |
 
-# 3. Verify namespace has sidecar injection
-oc get namespace app-ns -o yaml | grep istio
+Verify with: `oc get crd trafficextensions.extensions.istio.io`
 
-# 4. Verify pod has sidecar (2/2 containers)
-oc get pods -n app-ns
+### API structure
 
-# 5. Check Envoy listeners
-istioctl proxy-config listener -n app-ns deploy/test-app --port 8080
+TrafficExtension uses the same API group (`extensions.istio.io/v1alpha1`) and selector mechanism as WasmPlugin. The key difference is the extension type is nested:
+
+```yaml
+# WasmPlugin (current)
+spec:
+  url: http://wasm-server.app-ns.svc:8080/plugin.wasm
+  pluginConfig: {...}
+
+# TrafficExtension + Wasm (future — same binary, restructured fields)
+spec:
+  wasm:
+    url: http://wasm-server.app-ns.svc:8080/plugin.wasm
+    pluginConfig: {...}
+
+# TrafficExtension + Lua (future — no build needed, input-only recommended)
+spec:
+  lua:
+    inlineCode: |
+      local NEMO_CLUSTER = "outbound|80||nemo-pii.guardrails.svc.cluster.local"
+      ...
+      function envoy_on_request(request_handle)
+        ...
+      end
 ```
 
-### NeMo not reachable from Envoy
+### Requirements for Lua extension
 
-```bash
-# 1. Verify NeMo service exists and has endpoints
-oc get svc,endpoints nemo-pii -n guardrails
+- **No build toolchain** — Lua script is embedded inline in the YAML
+- **Cluster name** — same Envoy cluster name requirement as Wasm (`outbound|80||...`)
+- **HTTP callout API** — `request_handle:httpCall(cluster, headers, body, timeout_ms)` returns `(resp_headers, resp_body)` via `pcall`
+- **Buffer limit** — default 10 MB; sufficient for typical LLM request bodies (input guardrail). Large LLM response bodies may exceed limit — use Wasm for output guardrail
+- **L7 only** — Lua filters operate on HTTP only (no TCP)
+- **Recommended scope** — input guardrail (`envoy_on_request`) only; response guardrail (`envoy_on_response`) works but is constrained by buffer limits
 
-# 2. Verify AuthorizationPolicy isn't too restrictive
-oc get authorizationpolicy -n guardrails -o yaml
+Lua extension example for this POC (see `lua/nemo-input-guard.lua` for full script):
 
-# 3. Verify Envoy cluster name matches
-oc exec -n app-ns deploy/test-app -c istio-proxy -- \
-  pilot-agent request GET /clusters | grep nemo-pii
+```yaml
+apiVersion: extensions.istio.io/v1alpha1
+kind: TrafficExtension
+metadata:
+  name: nemo-input-guard
+  namespace: app-ns
+spec:
+  selector:
+    matchLabels:
+      guardrails.trustyai.io/config: pii
+  phase: AUTHZ          # AUTHZ runs before routing — ideal for blocking
+  priority: 10
+  lua:
+    inlineCode: |
+      local NEMO_CLUSTER = "outbound|80||nemo-pii.guardrails.svc.cluster.local"
+      local NEMO_HOST    = "nemo-pii.guardrails.svc.cluster.local"
+      local NEMO_PATH    = "/v1/guardrail/checks"
+      local TIMEOUT_MS   = 300
 
-# 4. Test direct connectivity from app pod (bypasses TrafficExtension)
-oc exec -n app-ns deploy/test-app -- \
-  curl -s http://nemo-pii.guardrails.svc:8000/v1/guardrail/checks \
-  -H "Content-Type: application/json" \
-  -d '{"model":"","messages":[{"role":"user","content":"test"}]}'
+      function envoy_on_request(request_handle)
+        local body = request_handle:body(true)
+        if body == nil or body:length() == 0 then return end
+
+        local ok, resp_headers, resp_body = pcall(function()
+          return request_handle:httpCall(
+            NEMO_CLUSTER,
+            {[":method"]="POST",[":path"]=NEMO_PATH,
+             [":authority"]=NEMO_HOST,["content-type"]="application/json"},
+            body:getBytes(0, body:length()), TIMEOUT_MS)
+        end)
+
+        if not ok then
+          request_handle:respond(
+            {[":status"]="403",["content-type"]="application/json"},
+            '{"error":"guardrail_unavailable"}')
+          return
+        end
+
+        if string.find(resp_body, '"status"%s*:%s*"blocked"') then
+          request_handle:respond(
+            {[":status"]="403",["content-type"]="application/json"},
+            '{"error":"blocked_by_guardrail","message":"Request blocked by safety guardrails"}')
+        end
+      end
 ```
 
-### Wasm plugin not loading (Phase 2)
+### Requirements for Wasm extension
 
-```bash
-# 1. Check istio-proxy logs for pull errors
-oc logs -n app-ns deploy/test-app -c istio-proxy | grep -i wasm
+- **Same Wasm binary** — `wasm/main.go` compiled with `GOOS=wasip1 GOARCH=wasm -buildmode=c-shared` produces the same binary for both WasmPlugin and TrafficExtension
+- **Same OCI TLS issue** — `oci://` URL with the internal registry still fails; continue using HTTP serving (`http://wasm-server.app-ns.svc:8080/plugin.wasm`) or use a registry with a valid certificate
+- **Full duplex** — handles both `envoy_on_request` and `envoy_on_response` without buffer limits
+- **Phase field** — `AUTHZ` (preferred for blocking) or `AUTHN`; same semantics as WasmPlugin
 
-# 2. Verify OCI image is accessible from cluster
-oc exec -n app-ns deploy/test-app -- \
-  curl -s https://quay.io/v2/rhai-guardrails/nemo-wasm-guard/tags/list
+### Ambient mode (targetRefs)
 
-# 3. Check TrafficExtension status
-oc describe trafficextension nemo-full-guard -n app-ns
+TrafficExtension adds `targetRefs` for ambient-mode clusters (no sidecar — uses ztunnel + waypoints). If the cluster uses ambient mode instead of sidecar mode, replace `selector` with `targetRefs`:
+
+```yaml
+spec:
+  # Instead of selector (sidecar):
+  targetRefs:
+  - kind: Service
+    name: my-ai-app-svc
+    namespace: app-ns
+  # OR for a specific service account:
+  - kind: ServiceAccount
+    name: my-ai-app
+    namespace: app-ns
 ```
 
-### 403 on clean requests (over-blocking)
+`targetRefs` is not available on the current cluster (sidecar mode, Istio 1.28.5).
 
-```bash
-# 1. Check NeMo response directly for the same payload
-oc -n guardrails port-forward svc/nemo-pii 8000:8000 &
-curl -s http://localhost:8000/v1/guardrail/checks \
-  -H "Content-Type: application/json" \
-  -d '{"model":"","messages":[{"role":"user","content":"<your-clean-content>"}]}' | jq .
-kill %1
+### Migration checklist (WasmPlugin → TrafficExtension)
 
-# 2. Check rails_status to see which rail is triggering
-# Adjust ConfigMap thresholds if needed (score_threshold, regex patterns)
-```
+| Step | Action |
+|---|---|
+| 1 | Verify `oc get crd trafficextensions.extensions.istio.io` returns a result |
+| 2 | Delete existing `WasmPlugin/nemo-input-guard` |
+| 3 | Apply `deploy/ossm/phase1-wasm/wasmplugin.yaml` converted to `TrafficExtension` (change kind, wrap `url` under `wasm:`) |
+| 4 | For Lua option: apply `deploy/ossm/phase1-lua/traffic-extension-lua.yaml` directly |
+| 5 | Verify Wasm loads: `oc logs -n app-ns deploy/<app> -c istio-proxy \| grep wasm` |
+| 6 | Re-run all Phase 1 tests |
+
+No changes to `wasm/main.go`, NeMo configuration, or label schema are required.
+
+---
+
+## Lessons Learned
+
+| Finding | Impact | Resolution |
+|---|---|---|
+| `TrafficExtension` not in Istio 1.28.5 | Entire Phase 1 mechanism changed | Use `WasmPlugin` (stable, equivalent) |
+| Envoy cannot verify internal registry self-signed cert | `oci://` URL unusable | Serve `.wasm` via HTTP from a pod inside the cluster |
+| `ISTIO_META_INSECURE_REGISTRIES` does not skip TLS in 1.28.5 | Spent time on dead end | Confirmed via proxy logs; moved to HTTP approach |
+| `NemoGuardrails` CRD has `default: true` field (RHOAI 3.4.2) | CR spec differs from 3.5 docs | Add `default: true` to `nemoConfigs[]` items |
+| NeMo service port is 80, not 8000 | Wrong Envoy cluster name | TrustyAI operator maps svc:80 → container:8000 |
+| `WasmPlugin` selector matches pod labels, not Deployment labels | All initial tests returned 200 | Patch `spec.template.metadata.labels`, not `metadata.labels` |
+| httpbin image tries to bind port 80 (root required) | Pod crashes under OpenShift restricted SCC | Override with `gunicorn -b 0.0.0.0:8080` |
+| `tetratelabs/proxy-wasm-go-sdk` is archived | Cannot use TinyGo approach | Use `proxy-wasm/proxy-wasm-go-sdk` with Go 1.24+ |
+| Internal registry was disabled (`Removed`) | Builds could not push | Enable with `managementState: Managed, storage: emptyDir` |
+| Existing `openshift-gateway` Istio is gateway-only | No sidecar injection by default | Deploy new `Istio` CR in `istio-system` with discovery selectors |
 
 ---
 
 ## Key Commands Reference
 
 ```bash
-# Get Envoy cluster name
+# Verify WasmPlugin is loaded in sidecar
 oc exec -n app-ns deploy/test-app -c istio-proxy -- \
-  pilot-agent request GET /clusters | grep nemo
+  pilot-agent request GET /config_dump 2>/dev/null | python3 -c \
+  "import sys,json; d=json.load(sys.stdin); print('wasm found' if 'plugin.wasm' in json.dumps(d) else 'NOT found')"
 
-# Check Envoy listeners on port 8080
-istioctl proxy-config listener -n app-ns deploy/test-app --port 8080
+# Check NeMo call stats
+oc exec -n app-ns deploy/test-app -c istio-proxy -- \
+  pilot-agent request GET /clusters 2>/dev/null | grep "nemo-pii.*rq_"
 
-# Watch NeMo logs during test
+# Watch sidecar logs during a test
+oc logs -n app-ns deploy/test-app -c istio-proxy -f | grep -i "wasm\|nemo\|blocked"
+
+# Watch NeMo logs during a test
 oc logs -n guardrails deploy/nemo-pii -f
 
-# Watch app sidecar logs
-oc logs -n app-ns deploy/test-app -c istio-proxy -f
+# Validate NeMo directly
+oc -n guardrails port-forward svc/nemo-pii 8080:80 &
+curl -s http://localhost:8080/v1/guardrail/checks \
+  -H "Content-Type: application/json" \
+  -d '{"model":"","messages":[{"role":"user","content":"test"}]}' | jq .
+kill %1
 
-# Check TrafficExtension resources
-oc get trafficextension -A
+# Check all WasmPlugin resources
+oc get wasmplugin -A
 
-# NeMo status
+# Check NeMo status
 oc get nemoguardrails -n guardrails
 
-# Validate NeMo manually
-oc -n guardrails port-forward svc/nemo-pii 8000:8000 &
-curl -s http://localhost:8000/v1/guardrail/checks \
-  -d '{"model":"","messages":[{"role":"user","content":"test"}]}' \
-  -H "Content-Type: application/json" | jq .
+# Check wasm-server is serving
+oc exec -n app-ns deploy/wasm-server -- \
+  curl -sI http://localhost:8080/plugin.wasm | head -3
 ```
 
 ---
@@ -455,18 +591,19 @@ curl -s http://localhost:8000/v1/guardrail/checks \
 
 | Task | Status | Notes |
 |---|---|---|
-| 0.1 Verify TrafficExtension CRD | ☐ | Blocking — do not proceed if absent |
-| 0.2 Label namespaces | ☐ | |
-| 0.3 Deploy NeMo CR | ☐ | |
-| 0.4 Validate NeMo endpoint | ☐ | Blocking — must return "success"/"blocked" correctly |
-| 0.5 Capture Envoy cluster name | ☐ | Update Lua/Wasm config with actual value |
-| 1.1 Review Lua script | ☐ | Update NEMO_CLUSTER constant |
-| 1.2 Deploy TrafficExtension Lua | ☐ | |
-| 1.3 Label test app | ☐ | |
-| 1.4 Verify filter in Envoy | ☐ | |
-| 1.5 Run Phase 1 tests | ☐ | All 3 tests must pass |
-| 2.1 Set up Wasm build env | ☐ | |
-| 2.2 Build Wasm module | ☐ | |
-| 2.3 Push to OCI registry | ☐ | Update TrafficExtension YAML with registry URL |
-| 2.4 Deploy TrafficExtension Wasm | ☐ | |
-| 2.5 Run Phase 2 tests | ☐ | All 3 tests must pass |
+| **Phase 0** | | |
+| 0.1 Enable internal registry | ✅ Done | emptyDir storage, single-node POC |
+| 0.2 Deploy OSSM Istio CR + IstioCNI | ✅ Done | v1.28.5, discovery selectors scoped to POC namespaces |
+| 0.3 Label namespaces | ✅ Done | guardrails + app-ns |
+| 0.4 Deploy NeMo CR | ✅ Done | RHOAI 3.4.2, `default: true` field required |
+| 0.5 Validate NeMo endpoint | ✅ Done | Port 80 (svc) → 8000 (container) |
+| 0.6 Capture Envoy cluster name | ✅ Done | `outbound\|80\|...` — service port, not container port |
+| **Phase 1** | | |
+| 1.1 Build Wasm module (in-cluster) | ✅ Done | Fedora + Go 1.24, proxy-wasm/proxy-wasm-go-sdk |
+| 1.2 Deploy wasm-server | ✅ Done | HTTP serving — OCI TLS workaround |
+| 1.3 Deploy WasmPlugin | ✅ Done | `http://wasm-server.app-ns.svc:8080/plugin.wasm` |
+| 1.4 Label test application | ✅ Done | Pod template labels (not Deployment labels) |
+| 1.5 Validate Phase 1 | ✅ Done | SSN/email/api_key → 403, clean → 200, unlabeled → 200 |
+| **Phase 2** | | |
+| 2.1 Deploy model endpoint | ☐ Pending | Needs vLLM or InferenceService on the cluster |
+| 2.2 Validate response blocking | ☐ Pending | Depends on 2.1 |
