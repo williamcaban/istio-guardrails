@@ -1,0 +1,29 @@
+# Phase 2: TrafficExtension with Wasm — full duplex (request + response)
+#
+# Targets pods labeled: guardrails.trustyai.io/config=pii
+# Checks both outbound request body and inbound response body.
+#
+# BEFORE APPLYING:
+# 1. Build and push the Wasm module (wasm/Makefile)
+# 2. Update the url field below with your registry path
+# 3. Verify nemoCluster value matches your cluster (Task 0.5)
+apiVersion: extensions.istio.io/v1alpha1
+kind: TrafficExtension
+metadata:
+  name: nemo-full-guard
+  namespace: app-ns
+spec:
+  selector:
+    matchLabels:
+      guardrails.trustyai.io/config: pii
+  phase: AUTHZ
+  priority: 10
+  wasm:
+    # Update this URL after building and pushing the Wasm module
+    url: oci://quay.io/rhai-guardrails/nemo-wasm-guard:0.1.0-poc
+    pluginConfig:
+      nemoCluster: "outbound|8000||nemo-pii.guardrails.svc.cluster.local"
+      nemoHost: "nemo-pii.guardrails.svc.cluster.local"
+      nemoPath: "/v1/guardrail/checks"
+      timeoutMs: 300
+      failMode: "closed"   # "closed" (default, recommended) | "open"

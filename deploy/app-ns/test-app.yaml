@@ -1,0 +1,31 @@
+# Minimal test pod — used to:
+# 1. Query Envoy cluster names (Task 0.5)
+# 2. Send test requests to model endpoint (Phase 1/2 tests)
+# Label is NOT applied here — applied manually per test case
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-app
+  namespace: app-ns
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: test-app
+  template:
+    metadata:
+      labels:
+        app: test-app
+        # guardrails.trustyai.io/config: pii   # uncomment to activate guardrail
+    spec:
+      containers:
+      - name: curl
+        image: curlimages/curl:latest
+        command: ["sleep", "infinity"]
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+          limits:
+            cpu: 100m
+            memory: 64Mi

@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: app-ns
+  labels:
+    istio-discovery: enabled    # required for OSSM discovery selectors
+    istio-injection: enabled    # enables sidecar injection (for default Istio revision)
+    # If Istio revision name is NOT "default", replace with:
+    # istio.io/rev: <revision-name>
+    # and remove istio-injection label

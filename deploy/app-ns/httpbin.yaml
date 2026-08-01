@@ -1,0 +1,43 @@
+# Mock LLM backend — httpbin echoes requests back
+# Used as a stand-in for vLLM during the POC (no model deployed on this cluster)
+# Exposes /post endpoint that echoes the request body — simulates /v1/chat/completions
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: httpbin
+  namespace: app-ns
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: httpbin
+  template:
+    metadata:
+      labels:
+        app: httpbin
+    spec:
+      containers:
+      - name: httpbin
+        image: docker.io/kennethreitz/httpbin:latest
+        ports:
+        - containerPort: 80
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: httpbin
+  namespace: app-ns
+spec:
+  selector:
+    app: httpbin
+  ports:
+  - name: http
+    port: 80
+    targetPort: 80

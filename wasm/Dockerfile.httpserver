@@ -1,0 +1,17 @@
+# Two-stage build: compile Wasm → serve via HTTP
+# Produces an image that serves plugin.wasm on port 8080 (no TLS, no certs)
+# WasmPlugin can then use: url: http://wasm-server.app-ns.svc:8080/plugin.wasm
+
+FROM registry.fedoraproject.org/fedora-minimal:latest AS builder
+RUN microdnf install -y golang && microdnf clean all
+WORKDIR /app
+COPY go.mod main.go ./
+RUN go mod tidy && \
+    GOOS=wasip1 GOARCH=wasm go build -buildmode=c-shared -o plugin.wasm ./...
+
+# Use UBI Python as the HTTP server (OpenShift compatible, runs as non-root)
+FROM registry.access.redhat.com/ubi9/python-312:latest
+WORKDIR /serve
+COPY --from=builder /app/plugin.wasm plugin.wasm
+EXPOSE 8080
+CMD ["python3", "-m", "http.server", "8080"]

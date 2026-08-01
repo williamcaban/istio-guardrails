@@ -1,0 +1,67 @@
+# Phase 1: TrafficExtension with inline Lua — input guardrail
+#
+# Targets pods labeled: guardrails.trustyai.io/config=pii
+# Phase: AUTHZ (runs before routing — ideal for blocking)
+#
+# BEFORE APPLYING: verify NEMO_CLUSTER value matches your cluster.
+# Run Task 0.5 (scripts/02-get-cluster-name.sh) first.
+apiVersion: extensions.istio.io/v1alpha1
+kind: TrafficExtension
+metadata:
+  name: nemo-input-guard
+  namespace: app-ns
+spec:
+  selector:
+    matchLabels:
+      guardrails.trustyai.io/config: pii
+  phase: AUTHZ
+  priority: 10
+  lua:
+    inlineCode: |
+      local NEMO_CLUSTER = "outbound|8000||nemo-pii.guardrails.svc.cluster.local"
+      local NEMO_HOST    = "nemo-pii.guardrails.svc.cluster.local"
+      local NEMO_PATH    = "/v1/guardrail/checks"
+      local TIMEOUT_MS   = 300
+
+      function envoy_on_request(request_handle)
+        local body = request_handle:body(true)
+        if body == nil or body:length() == 0 then return end
+
+        local ok, resp_headers, resp_body = pcall(function()
+          return request_handle:httpCall(
+            NEMO_CLUSTER,
+            {
+              [":method"]      = "POST",
+              [":path"]        = NEMO_PATH,
+              [":authority"]   = NEMO_HOST,
+              ["content-type"] = "application/json",
+            },
+            body:getBytes(0, body:length()),
+            TIMEOUT_MS
+          )
+        end)
+
+        if not ok then
+          request_handle:respond(
+            {[":status"] = "403", ["content-type"] = "application/json"},
+            '{"error":"guardrail_unavailable","message":"Guardrail service unreachable"}'
+          )
+          return
+        end
+
+        local http_status = resp_headers[":status"]
+        if http_status ~= "200" then
+          request_handle:respond(
+            {[":status"] = "403", ["content-type"] = "application/json"},
+            string.format('{"error":"guardrail_error","message":"NeMo returned HTTP %s"}', http_status)
+          )
+          return
+        end
+
+        if string.find(resp_body, '"status"%s*:%s*"blocked"') then
+          request_handle:respond(
+            {[":status"] = "403", ["content-type"] = "application/json"},
+            '{"error":"blocked_by_guardrail","message":"Request blocked by safety guardrails"}'
+          )
+        end
+      end

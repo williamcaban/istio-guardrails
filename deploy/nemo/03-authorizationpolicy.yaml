@@ -1,0 +1,19 @@
+# Restrict NeMo to mesh-internal traffic only.
+# Only pods in app-ns can reach nemo-pii:8000.
+# This replaces enable-auth annotation for the POC.
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: nemo-pii-mesh-only
+  namespace: guardrails
+spec:
+  selector:
+    matchLabels:
+      app: nemo-pii
+  action: ALLOW
+  rules:
+  - from:
+    - source:
+        namespaces:
+          - app-ns
+          - istio-system   # allow istio control plane health checks
