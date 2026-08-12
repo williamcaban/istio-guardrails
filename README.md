@@ -313,16 +313,6 @@ oc delete namespace guardrails app-ns istio-system istio-cni --ignore-not-found
 
 ---
 
-## Contacts
-
-| Person | Handle | Role |
-|---|---|---|
-| Jamie Longmuir | jlongmui | OSSM PM — TrafficExtension support boundary |
-| Kuadrant team | — | Most TrafficExtension hands-on experience in Red Hat |
-| Mac Misiura | mmisiura | NeMo upstream — endpoint deprecation (RHAIRFE-2996) |
-
----
-
 ## Phase 2 — Wasm full-duplex guardrail
 
 Phase 2 adds response interception via a Wasm module (`wasm/main.go`).
