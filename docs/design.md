@@ -413,17 +413,17 @@ If the IstioRevision name is not `default` (check with `oc get istiorevisions`),
 
 ---
 
-## 9. Relationship to DAGA Architecture
+## 9. Design Rationale
 
-This POC is a direct instantiation of the Distributed Agentic Guardrail Architecture (DAGA) Tier 1 Sensor pattern:
+This POC demonstrates a **distributed guardrail enforcement** pattern with three logical layers:
 
-| DAGA Tier | DAGA Role | This POC |
+| Layer | Role | This POC |
 |---|---|---|
-| Tier 1 | Sensor (intercept) | TrafficExtension (Lua/Wasm) on Envoy sidecar |
-| Tier 2 | Engine (content analysis) | NeMo Guardrails (`/v1/guardrail/checks`) |
-| Tier 3 | Controller (policy distribution) | ConfigMap + pod label (manual; future: operator) |
+| Sensor (intercept) | Transparent traffic interception at the workload | TrafficExtension (Lua/Wasm) on Envoy sidecar |
+| Engine (analysis) | Content-aware enforcement | NeMo Guardrails (`/v1/guardrail/checks`) |
+| Controller (policy) | Policy distribution and targeting | ConfigMap + pod label (manual; future: operator) |
 
-The label-based pod targeting is the "sensor instantiation" mechanism DAGA needs — deploy enforcement as close to the source as possible without requiring application code changes.
+The label-based pod targeting deploys enforcement as close to the source as possible — no application code changes, no centralized gateway dependency.
 
 ---
 
@@ -438,7 +438,7 @@ The label-based pod targeting is the "sensor instantiation" mechanism DAGA needs
 | **Controller** | A Kubernetes controller that watches pod labels and auto-creates/deletes `TrafficExtension` and `NemoGuardrails` CRs. App owners only manage labels. |
 | **Streaming support** | Extend Wasm to handle SSE streaming responses incrementally rather than buffering the full body. |
 | **Multi-profile routing** | Configure NeMo with multiple rail configs, routing by HTTP header. Eliminates one-NeMo-per-profile constraint. |
-| **DAGA Tier 3 integration** | Feed enforcement telemetry (blocked request count, latency) to ASAGO policy control plane (RHAISTRAT-1778). |
+| **Telemetry integration** | Feed enforcement telemetry (blocked request count, latency) to a central policy control plane for automated guardrail tuning. |
 
 ---
 
@@ -452,5 +452,4 @@ The label-based pod targeting is the "sensor instantiation" mechanism DAGA needs
 | RHOAI NeMo Guardrails docs (3.5) | https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.5/html-single/enabling_ai_safety_with_guardrails/index |
 | OSSM 3.4 Installation docs | https://docs.redhat.com/en/documentation/red_hat_openshift_service_mesh/3.4/html-single/installing/index |
 | proxy-wasm-go-sdk (Go 1.24+) | https://github.com/proxy-wasm/proxy-wasm-go-sdk |
-| DAGA architecture | `../trustworthy-ai/knowledge/shared/distributed-agentic-guardrail-architecture.md` |
-| POC project memory | `../trustworthy-ai/memory/project_nemo_ossm_guardrail_integration.md` |
+| proxy-wasm-go-sdk README | https://github.com/proxy-wasm/proxy-wasm-go-sdk/blob/main/README.md |
