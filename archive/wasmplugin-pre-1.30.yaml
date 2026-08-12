@@ -1,0 +1,29 @@
+# ARCHIVED — pre-Istio 1.30 WasmPlugin approach (OSSM 3.3.1 / Istio 1.28.5)
+#
+# DO NOT APPLY. Kept for historical reference only.
+# As of OSSM 3.4.1 / Istio 1.30.3, use TrafficExtension instead:
+#   deploy/ossm/phase1-lua/traffic-extension-lua.yaml   (Lua, no build required)
+#   deploy/ossm/phase2-wasm/traffic-extension-wasm.yaml (Wasm, full duplex)
+#
+# Known errors in this file (corrected in TrafficExtension versions):
+#   - phase: AUTHN  → should be AUTHZ (preferred for blocking in 1.30+)
+#   - nemoCluster port 8000 → 80 (TrustyAI operator exposes ClusterIP port 80)
+#   - timeoutMs: 300 → 3000 (NeMo cold-start ~1.2s; 300ms causes false 504s)
+apiVersion: extensions.istio.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: nemo-input-guard
+  namespace: app-ns
+spec:
+  selector:
+    matchLabels:
+      guardrails.trustyai.io/config: pii
+  phase: AUTHN
+  priority: 10
+  url: oci://quay.io/rhai-guardrails/nemo-wasm-guard:0.1.0-poc
+  pluginConfig:
+    nemoCluster: "outbound|8000||nemo-pii.guardrails.svc.cluster.local"
+    nemoHost: "nemo-pii.guardrails.svc.cluster.local"
+    nemoPath: "/v1/guardrail/checks"
+    timeoutMs: 300
+    failMode: "closed"

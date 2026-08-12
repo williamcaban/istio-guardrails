@@ -1,0 +1,26 @@
+# Istio control plane — OSSM 3.4.1 (Sail Operator), Istio 1.30.3
+#
+# Prerequisites:
+#   1. servicemeshoperator3 installed via OLM (openshift-operators namespace)
+#   2. istio-system namespace created BEFORE applying this CR
+#      (Sail Operator returns ReconcileError if namespace is absent)
+#
+# Creates IstioRevision named "default".
+# When revision = "default", use istio-injection=enabled for namespace labeling.
+# For any other revision name, use istio.io/rev=<name> instead.
+#
+# discoverySelectors scopes the control plane to namespaces labeled:
+#   istio-discovery=enabled
+# Label istio-system, istio-cni, guardrails, and app-ns namespaces accordingly.
+apiVersion: sailoperator.io/v1
+kind: Istio
+metadata:
+  name: default
+spec:
+  version: v1.30.3
+  namespace: istio-system
+  values:
+    meshConfig:
+      discoverySelectors:
+      - matchLabels:
+          istio-discovery: enabled

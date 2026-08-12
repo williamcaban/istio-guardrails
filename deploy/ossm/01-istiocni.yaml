@@ -1,0 +1,8 @@
+# Istio CNI plugin — required alongside the Istio control plane
+# Deploy AFTER creating istio-cni namespace and AFTER the Istio CR is applied.
+apiVersion: sailoperator.io/v1
+kind: IstioCNI
+metadata:
+  name: default
+spec:
+  namespace: istio-cni

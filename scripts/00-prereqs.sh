@@ -1,67 +1,90 @@
 #!/usr/bin/env bash
-# Phase 0, Task 0.1-0.2: Verify prerequisites and label namespaces
+# Phase 0, Tasks 0.1-0.2: Deploy OSSM control plane and label namespaces
+# Verified on: OCP 4.20.32 / OSSM 3.4.1 (Sail Operator) / Istio 1.30.3
 set -euo pipefail
 
-echo "=== Phase 0: Prerequisites ==="
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+echo "=== Phase 0: OSSM Control Plane + Prerequisites ==="
 
 # --- Check required tools ---
-for tool in oc kubectl istioctl jq; do
-  if ! command -v $tool &>/dev/null; then
+for tool in oc jq; do
+  if ! command -v "$tool" &>/dev/null; then
     echo "ERROR: $tool not found. Install it before proceeding."
     exit 1
   fi
 done
 echo "✓ Required tools present"
 
-# --- Verify OSSM installed ---
+# --- Verify Operators installed ---
 echo ""
-echo "--- Checking OSSM and Istio revision ---"
-oc get istiorevisions 2>/dev/null || {
-  echo "ERROR: No IstioRevisions found. Is OSSM installed?"
-  exit 1
-}
+echo "--- Checking installed operators ---"
 
-ISTIO_REV=$(oc get istiorevisions -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-ISTIO_VER=$(oc get istiorevisions -o jsonpath='{.items[0].status.observedValues[0]}' 2>/dev/null || echo "unknown")
-echo "✓ Istio revision: $ISTIO_REV"
+oc get crd trafficextensions.extensions.istio.io &>/dev/null \
+  || { echo "ERROR: OSSM Operator (servicemeshoperator3) not installed — TrafficExtension CRD missing"; exit 1; }
+echo "✓ OSSM Operator present (TrafficExtension CRD found)"
 
-# --- Verify TrafficExtension CRD ---
+oc get crd nemoguardrails.trustyai.opendatahub.io &>/dev/null \
+  || { echo "ERROR: TrustyAI Operator not installed — NemoGuardrails CRD missing"; exit 1; }
+echo "✓ TrustyAI Operator present (NemoGuardrails CRD found)"
+
+# --- Create namespaces ---
+# CRITICAL: istio-system and istio-cni must exist BEFORE applying Istio/IstioCNI CRs.
+# The Sail Operator returns ReconcileError: "namespace does not exist" if absent.
 echo ""
-echo "--- Checking TrafficExtension CRD ---"
-if ! oc get crd trafficextensions.extensions.istio.io &>/dev/null; then
-  echo "ERROR: TrafficExtension CRD not found in cluster."
-  echo "       Contact Jamie Longmuir (jlongmui) — OSSM PM."
-  echo "       Fallback: use WasmPlugin (deploy/ossm/phase1-lua/ won't work)."
-  exit 1
-fi
-echo "✓ TrafficExtension CRD present"
+echo "--- Creating namespaces ---"
+for ns in istio-system istio-cni guardrails app-ns; do
+  if oc get namespace "$ns" &>/dev/null; then
+    echo "  namespace/$ns already exists"
+  else
+    oc create namespace "$ns"
+    echo "✓ namespace/$ns created"
+  fi
+done
+
+# --- Deploy OSSM control plane ---
+echo ""
+echo "--- Deploying Istio control plane (OSSM 3.4.1 / Istio 1.30.3) ---"
+oc apply -f "$REPO_ROOT/deploy/ossm/00-istio.yaml"
+oc apply -f "$REPO_ROOT/deploy/ossm/01-istiocni.yaml"
+
+echo "  Waiting for Istio control plane (up to 5 min)..."
+oc wait --for=condition=Ready istios/default --timeout=5m
+oc wait --for=condition=Ready IstioCNI/default --timeout=5m
+echo "✓ Istio 1.30.3 and CNI ready"
+
+# --- Get revision name ---
+ISTIO_REV=$(oc get istiorevision -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "default")
+echo "  IstioRevision name: $ISTIO_REV"
 
 # --- Label namespaces ---
+# discoverySelectors in the Istio CR requires istio-discovery=enabled on all mesh namespaces.
 echo ""
-echo "--- Labeling namespaces ---"
+echo "--- Labeling namespaces for mesh discovery and injection ---"
 
-# guardrails namespace
-if ! oc get namespace guardrails &>/dev/null; then
-  echo "Creating guardrails namespace..."
-  oc new-project guardrails
-fi
-oc label namespace guardrails istio-discovery=enabled --overwrite
-echo "✓ guardrails namespace labeled"
+oc label namespace istio-system istio-discovery=enabled --overwrite
+oc label namespace istio-cni    istio-discovery=enabled --overwrite
+oc label namespace guardrails   istio-discovery=enabled --overwrite
+oc label namespace app-ns       istio-discovery=enabled --overwrite
+echo "✓ Discovery labels applied"
 
-# app-ns namespace
-if ! oc get namespace app-ns &>/dev/null; then
-  echo "Creating app-ns namespace..."
-  oc new-project app-ns
-fi
-
+# Sidecar injection label depends on revision name
 if [ "$ISTIO_REV" = "default" ]; then
-  oc label namespace app-ns istio-discovery=enabled istio-injection=enabled --overwrite
+  oc label namespace app-ns istio-injection=enabled --overwrite
   echo "✓ app-ns labeled with istio-injection=enabled (default revision)"
 else
-  oc label namespace app-ns istio-discovery=enabled "istio.io/rev=$ISTIO_REV" --overwrite
+  oc label namespace app-ns "istio.io/rev=$ISTIO_REV" --overwrite
   echo "✓ app-ns labeled with istio.io/rev=$ISTIO_REV"
 fi
 
+# --- Verify ---
 echo ""
-echo "=== Prerequisites complete ==="
+echo "--- Cluster state ---"
+oc get pods -n istio-system
+oc get pods -n istio-cni
+echo ""
+oc get istio,istiocni,istiorevision -A
+
+echo ""
+echo "=== OSSM prerequisites complete ==="
 echo "Next step: scripts/01-deploy-nemo.sh"

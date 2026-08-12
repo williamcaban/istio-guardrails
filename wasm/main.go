@@ -15,7 +15,7 @@ import (
 	"github.com/proxy-wasm/proxy-wasm-go-sdk/proxywasm/types"
 )
 
-// pluginConfig is parsed from the WasmPlugin.spec.pluginConfig field.
+// pluginConfig is parsed from TrafficExtension.spec.wasm.pluginConfig (JSON).
 type pluginConfig struct {
 	NemoCluster string `json:"nemoCluster"`
 	NemoHost    string `json:"nemoHost"`
@@ -45,7 +45,7 @@ func (*vmContext) NewPluginContext(contextID uint32) types.PluginContext {
 	return &pluginContext{}
 }
 
-// --- Plugin context (one per WasmPlugin instance) ---
+// --- Plugin context (one per TrafficExtension instance) ---
 
 type pluginContext struct {
 	types.DefaultPluginContext
@@ -54,12 +54,12 @@ type pluginContext struct {
 func (p *pluginContext) OnPluginStart(pluginConfigSize int) types.OnPluginStartStatus {
 	raw, err := proxywasm.GetPluginConfiguration()
 	if err != nil || len(raw) == 0 {
-		// Safe defaults — must match whatever is in the WasmPlugin CR
+		// Safe defaults — must match TrafficExtension.spec.wasm.pluginConfig
 		cfg = pluginConfig{
 			NemoCluster: "outbound|80||nemo-pii.guardrails.svc.cluster.local",
 			NemoHost:    "nemo-pii.guardrails.svc.cluster.local",
 			NemoPath:    "/v1/guardrail/checks",
-			TimeoutMs:   300,
+			TimeoutMs:   3000,
 			FailMode:    "closed",
 		}
 		proxywasm.LogWarn("nemo-guard: no plugin config found, using defaults")

@@ -1,8 +1,28 @@
-# Implementation Plan: Istio WasmPlugin × NeMo Guardrails POC
+# ARCHIVED: WasmPlugin POC — Istio 1.28.5 (pre-migration)
 
-**Version**: 1.0 (Validated)  
-**Date**: 2026-08-01  
-**Cluster**: OCP 4.21.17, OSSM 3.3.1 (Istio 1.28.5), RHOAI 3.4.2  
+> **This document is archived.** It records the original WasmPlugin-based POC
+> run on OSSM 3.3.1 / Istio 1.28.5. As of 2026-08-12 the project has migrated
+> to **TrafficExtension (Lua)** on OSSM 3.4.1 / Istio 1.30.3.
+>
+> For current design and procedures, see:
+> - `docs/design.md` — architecture and configuration reference
+> - `scripts/00-prereqs.sh` — OSSM deployment (Istio CR + IstioCNI)
+> - `deploy/ossm/phase1-lua/traffic-extension-lua.yaml` — active Phase 1 manifest
+>
+> Key corrections made during migration (do not use old values):
+> - Envoy cluster port: `8000` → **`80`** (TrustyAI operator ClusterIP port)
+> - Lua timeout: `300ms` → **`3000ms`** (NeMo cold-start ~1.2s)
+> - NeMo CR `nemoConfigs[].name`: `"nemo-pii-config"` → **`"pii"`** (directory name, not ConfigMap name)
+> - NeMo `config.yaml`: add `models: []` and `output.flows: []` to prevent LLM generation on clean requests
+> - `WasmPlugin.phase: AUTHN` → **`TrafficExtension.phase: AUTHZ`**
+
+---
+
+# Implementation Plan: Istio WasmPlugin × NeMo Guardrails POC (ARCHIVED)
+
+**Version**: 1.0 (Validated on Istio 1.28.5 — superseded by TrafficExtension on Istio 1.30.3)
+**Date**: 2026-08-01
+**Cluster**: OCP 4.21.17, OSSM 3.3.1 (Istio 1.28.5), RHOAI 3.4.2
 **Repo**: https://github.com/williamcaban/istio-guardrails
 
 ---

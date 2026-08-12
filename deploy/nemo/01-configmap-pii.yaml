@@ -5,6 +5,10 @@ metadata:
   namespace: guardrails
 data:
   config.yaml: |
+    # models: [] prevents NeMo from attempting LLM generation on clean requests.
+    # Without this, NeMo tries to call a configured LLM, fails with the
+    # placeholder API key, and returns 504 to Envoy on allowed (non-PII) requests.
+    models: []
     rails:
       config:
         sensitive_data_detection:
@@ -26,5 +30,7 @@ data:
         flows:
           - detect sensitive data on input
           - regex check input
+      output:
+        flows: []
   rails.co: |
-    # Built-in rails only
+    # Built-in input rails only — no dialog or output rails

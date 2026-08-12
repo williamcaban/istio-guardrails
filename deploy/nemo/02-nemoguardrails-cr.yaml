@@ -4,8 +4,11 @@ metadata:
   name: nemo-pii
   namespace: guardrails
 spec:
+  # nemoConfigs[].name is the config DIRECTORY name inside /app/config/<name>/
+  # It must be alphanumeric/dashes/underscores — NOT the ConfigMap name.
+  # Confirmed: name: "pii" creates /app/config/pii/ mounted from nemo-pii-config.
   nemoConfigs:
-    - name: nemo-pii-config
+    - name: pii
       configMaps:
         - nemo-pii-config
       default: true

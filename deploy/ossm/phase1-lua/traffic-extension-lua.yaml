@@ -1,10 +1,20 @@
-# Phase 1: TrafficExtension with inline Lua — input guardrail
+# Phase 1: TrafficExtension with inline Lua — input guardrail (no Wasm required)
 #
 # Targets pods labeled: guardrails.trustyai.io/config=pii
 # Phase: AUTHZ (runs before routing — ideal for blocking)
 #
+# Confirmed working on: OSSM 3.4.1 / Istio 1.30.3 / OCP 4.20 (2026-08-12)
+# Phase 1 test results:
+#   Clean request      → 200 ✅
+#   Email PII          → 403 ✅ (blocked_by_guardrail)
+#   Phone PII          → 403 ✅ (blocked_by_guardrail)
+#   api_key (regex)    → 403 ✅ (blocked_by_guardrail)
+#
 # BEFORE APPLYING: verify NEMO_CLUSTER value matches your cluster.
-# Run Task 0.5 (scripts/02-get-cluster-name.sh) first.
+# Run: oc exec -n app-ns <pod> -c istio-proxy -- \
+#        pilot-agent request GET /clusters | grep nemo-pii
+# Expected: outbound|80||nemo-pii.guardrails.svc.cluster.local
+#   (TrustyAI operator exposes NeMo on ClusterIP port 80 → targetPort 8000)
 apiVersion: extensions.istio.io/v1alpha1
 kind: TrafficExtension
 metadata:
@@ -18,10 +28,12 @@ spec:
   priority: 10
   lua:
     inlineCode: |
-      local NEMO_CLUSTER = "outbound|8000||nemo-pii.guardrails.svc.cluster.local"
+      -- Port 80: TrustyAI operator service port (ClusterIP 80 → pod 8000)
+      -- Timeout 3000ms: NeMo cold-start ~1.2s; 300ms caused false 504s
+      local NEMO_CLUSTER = "outbound|80||nemo-pii.guardrails.svc.cluster.local"
       local NEMO_HOST    = "nemo-pii.guardrails.svc.cluster.local"
       local NEMO_PATH    = "/v1/guardrail/checks"
-      local TIMEOUT_MS   = 300
+      local TIMEOUT_MS   = 3000
 
       function envoy_on_request(request_handle)
         local body = request_handle:body(true)
