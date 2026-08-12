@@ -1,11 +1,5 @@
 # NeMo Guardrails × OSSM TrafficExtension
 
-**Status**: Phase 1 complete ✅ — Lua input guardrail working end-to-end
-**Platform**: OCP 4.20+ / OSSM 3.4.1 (Sail Operator) / Istio 1.30.3 / RHOAI 3.5
-**License**: Apache 2.0
-
----
-
 ## What this is
 
 A proof-of-concept that lets application owners activate **NeMo Guardrails PII detection** on an AI workload by adding a **single Kubernetes label** — with no application code changes and no gateway dependency.
