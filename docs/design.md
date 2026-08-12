@@ -245,6 +245,35 @@ The Envoy cluster name uses the service port: `outbound|80||nemo-pii.guardrails.
 
 ## 5. Phase 2 — Wasm Plugin Design (Full Duplex)
 
+### TrafficExtension vs WasmPlugin vs Wasm module
+
+`TrafficExtension` **replaces `WasmPlugin`** as the Kubernetes resource kind — it does not eliminate Wasm. The relationship is:
+
+```
+TrafficExtension (API resource kind — replaces WasmPlugin)
+  ├── spec.lua:   ← NEW in Istio 1.30; inline Lua, no build toolchain (Phase 1)
+  └── spec.wasm:  ← same Wasm binary as before, nested under new CR kind (Phase 2)
+```
+
+| | `WasmPlugin` | `TrafficExtension` |
+|---|---|---|
+| API kind | `WasmPlugin` | `TrafficExtension` |
+| Extension types | Wasm only | **Lua** or Wasm (mutually exclusive) |
+| Status in OSSM 3.4 | Being deprecated | Tech preview (successor) |
+| Wasm binary compatibility | Yes | Yes — same `plugin.wasm` binary |
+
+**Migration** from WasmPlugin to TrafficExtension for Wasm is a single CR change:
+```yaml
+# Before (WasmPlugin)              # After (TrafficExtension)
+kind: WasmPlugin                   kind: TrafficExtension
+spec:                              spec:
+  url: oci://...                     wasm:
+  pluginConfig: {...}                  url: oci://...
+                                       pluginConfig: {...}
+```
+
+The `wasm/main.go` binary is unchanged — only the CR wrapper changes.
+
 ### 5.1 SDK and Build
 
 | Item | Value |
@@ -267,7 +296,7 @@ init()
 
 vmContext.NewPluginContext(id)
   └── pluginContext{}
-       └── OnPluginStart()  ← loads JSON pluginConfig from WasmPlugin CR
+       └── OnPluginStart()  ← loads JSON pluginConfig from TrafficExtension.spec.wasm.pluginConfig
        └── NewHttpContext(id)
             └── httpContext{}
                  ├── OnHttpRequestBody()   ← buffers body, calls NeMo, blocks or continues
@@ -276,31 +305,36 @@ vmContext.NewPluginContext(id)
 
 ### 5.3 Plugin Configuration
 
-Passed via `WasmPlugin.spec.pluginConfig` (JSON, parsed in `OnPluginStart`):
+Passed via `TrafficExtension.spec.wasm.pluginConfig` (JSON, parsed in `OnPluginStart`):
 
 ```json
 {
   "nemoCluster": "outbound|80||nemo-pii.guardrails.svc.cluster.local",
   "nemoHost":    "nemo-pii.guardrails.svc.cluster.local",
   "nemoPath":    "/v1/guardrail/checks",
-  "timeoutMs":   300,
+  "timeoutMs":   3000,
   "failMode":    "closed"
 }
 ```
 
-### 5.4 HTTP Serving Instead of OCI
+### 5.4 Wasm Delivery — OCI vs HTTP
 
-**Problem**: Envoy sidecars cannot pull Wasm plugins from the OpenShift internal image registry via `oci://` because the registry uses a self-signed certificate that Envoy's trust store does not include. `ISTIO_META_INSECURE_REGISTRIES` does not bypass TLS verification in Istio 1.28.5.
+`TrafficExtension.spec.wasm.url` supports four schemes: `oci://`, `http://`, `https://`, `file://`.
 
-**Solution**: A second build stage produces a Python `http.server` image. Envoy fetches `plugin.wasm` over plain HTTP (`url: http://wasm-server.app-ns.svc:8080/plugin.wasm`). HTTP avoids all certificate issues and is functionally equivalent for Wasm delivery.
+**Recommended (Istio 1.30+)**: push the binary to an external OCI registry (Quay.io) with a valid cert and use `oci://`:
+```yaml
+wasm:
+  url: oci://quay.io/rhai-guardrails/nemo-wasm-guard:0.1.0
+  sha256: <sha256-of-wasm-binary>
+```
+
+**Fallback (internal registry / self-signed cert)**: serve the binary over plain HTTP from a sidecar-free pod. This was the workaround required under Istio 1.28.5 where `ISTIO_META_INSECURE_REGISTRIES` did not bypass TLS for OCI pulls. Under Istio 1.30.3, OCI with a valid external cert is the preferred path.
 
 ```
-BuildConfig (nemo-wasm-guard via Dockerfile.httpserver)
-  Stage 1: fedora-minimal + golang → builds plugin.wasm (GOOS=wasip1)
-  Stage 2: ubi9/python-312 → copies plugin.wasm → runs python3 -m http.server 8080
+# HTTP fallback build (still valid if OCI cert issues arise)
+Stage 1: golang → builds plugin.wasm (GOOS=wasip1 GOARCH=wasm)
+Stage 2: ubi9/python-39 → serves plugin.wasm via python3 -m http.server 8080
 ```
-
-The `wasm-server` deployment runs without an Envoy sidecar (`sidecar.istio.io/inject: "false"`) — it is infrastructure, not a workload.
 
 ---
 
